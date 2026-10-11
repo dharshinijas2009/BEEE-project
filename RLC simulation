@@ -1,0 +1,664 @@
+"""
+RLC Circuit Simulator  (multi-page version)
+Pages : Welcome -> Circuit Setup -> (Circuit Analysis | Graph Analysis) -> Result Analysis
+Needs : pip install numpy matplotlib
+"""
+import csv
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ---------------------------------------------------------------- theme
+BG, CARD = "#0b1020", "#151c36"
+CYAN, PINK, AMBER = "#22d3ee", "#f472b6", "#fbbf24"
+GREEN, VIOLET = "#34d399", "#a78bfa"
+TEXT, MUTED = "#e5e7eb", "#94a3b8"
+FONT = "Segoe UI"
+
+
+def lighten(hex_color, amt=0.22):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    r, g, b = (int(c + (255 - c) * amt) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def make_button(parent, text, command, bg, fg="white", size=13, padx=26, pady=10):
+    """Label-based button (looks the same on Windows / Mac / Linux)."""
+    b = tk.Label(parent, text=text, bg=bg, fg=fg, font=(FONT, size, "bold"),
+                 padx=padx, pady=pady, cursor="hand2")
+    hover = lighten(bg)
+    b.bind("<Button-1>", lambda e: command())
+    b.bind("<Enter>", lambda e: b.config(bg=hover))
+    b.bind("<Leave>", lambda e: b.config(bg=bg))
+    return b
+
+
+def make_entry(parent, color, width=12):
+    return tk.Entry(parent, font=(FONT, 14), width=width, justify="center", bg=BG, fg="white",
+                    insertbackground="white", relief="flat", highlightthickness=2,
+                    highlightbackground="#334155", highlightcolor=color)
+
+
+def nature(phi):
+    if abs(phi) < 1:
+        return "Resistive"
+    return "Inductive" if phi > 0 else "Capacitive"
+
+
+def rating(pf):
+    if pf >= 0.95:
+        return "Excellent"
+    if pf >= 0.80:
+        return "Good"
+    if pf >= 0.50:
+        return "Average"
+    return "Poor"
+
+
+# ---------------------------------------------------------------- circuit model
+class Circuit:
+    def __init__(self):
+        self.V, self.R, self.L, self.C, self.kind = 10.0, 100.0, 10e-3, 10e-6, "Series"
+
+    @property
+    def f0(self):
+        return 1 / (2 * math.pi * math.sqrt(self.L * self.C))
+
+    @property
+    def Q(self):
+        if self.kind == "Series":
+            return math.sqrt(self.L / self.C) / self.R
+        return self.R * math.sqrt(self.C / self.L)
+
+    def metrics(self, f, kind=None):
+        kind = kind or self.kind
+        f = np.asarray(f, dtype=float)
+        w = 2 * np.pi * f
+        XL, XC = w * self.L, 1 / (w * self.C)
+        if kind == "Series":
+            Z = self.R + 1j * (XL - XC)
+        else:  # parallel R || L || C
+            Y = 1 / self.R + 1j * (w * self.C - 1 / XL)
+            Z = 1 / Y
+        mag, phi = np.abs(Z), np.angle(Z)
+        I = self.V / mag
+        return {"f": f, "Z": mag, "I": I, "phi": np.degrees(phi), "pf": np.cos(phi),
+                "XL": XL, "XC": XC, "VR": I * self.R, "VL": I * XL, "VC": I * XC,
+                "IR": self.V / self.R + 0 * f, "IL": self.V / XL, "IC": self.V / XC}
+
+
+BOTH, SER, PAR = ("Series", "Parallel"), ("Series",), ("Parallel",)
+# every quantity the user can put on the X or Y axis of the Graph Analysis page
+PARAMS = {
+    "Frequency (Hz)": dict(fn=lambda m: m["f"], unit="Hz", kinds=BOTH),
+    "Current (mA)": dict(fn=lambda m: m["I"] * 1000, unit="mA", kinds=BOTH),
+    "Impedance (Ω)": dict(fn=lambda m: m["Z"], unit="Ω", kinds=BOTH),
+    "Phase angle (°)": dict(fn=lambda m: m["phi"], unit="°", kinds=BOTH),
+    "Power factor": dict(fn=lambda m: m["pf"], unit="", kinds=BOTH),
+    "Inductive reactance XL (Ω)": dict(fn=lambda m: m["XL"], unit="Ω", kinds=BOTH),
+    "Capacitive reactance XC (Ω)": dict(fn=lambda m: m["XC"], unit="Ω", kinds=BOTH),
+    "Voltage across R (V)": dict(fn=lambda m: m["VR"], unit="V", kinds=SER),
+    "Voltage across L (V)": dict(fn=lambda m: m["VL"], unit="V", kinds=SER),
+    "Voltage across C (V)": dict(fn=lambda m: m["VC"], unit="V", kinds=SER),
+    "Resistor current IR (mA)": dict(fn=lambda m: m["IR"] * 1000, unit="mA", kinds=PAR),
+    "Inductor current IL (mA)": dict(fn=lambda m: m["IL"] * 1000, unit="mA", kinds=PAR),
+    "Capacitor current IC (mA)": dict(fn=lambda m: m["IC"] * 1000, unit="mA", kinds=PAR),
+}
+
+
+# ---------------------------------------------------------------- pages
+class WelcomePage(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        self.cv = tk.Canvas(self, bg=BG, highlightthickness=0)
+        self.cv.pack(fill="both", expand=True)
+        self.btn = make_button(self.cv, "Start Simulation  →", lambda: app.show("setup"),
+                               CYAN, fg=BG, size=18, padx=40, pady=14)
+        self.cv.bind("<Configure>", self.draw)
+
+    def draw(self, e):
+        cv, w, h = self.cv, e.width, e.height
+        cv.delete("all")
+        c1, c2, steps = (11, 16, 32), (60, 20, 100), 60
+        for i in range(steps):
+            t = i / steps
+            col = "#%02x%02x%02x" % tuple(int(c1[k] + (c2[k] - c1[k]) * t) for k in range(3))
+            cv.create_rectangle(0, h * i / steps, w, h * (i + 1) / steps + 1, fill=col, outline=col)
+        for amp, col, ph in ((55, CYAN, 0), (38, PINK, 1.6), (24, AMBER, 3.2)):
+            pts = []
+            for x in range(0, w + 1, 6):
+                pts += [x, h * 0.82 + amp * math.sin(x / 70 + ph)]
+            cv.create_line(*pts, fill=col, width=3, smooth=True)
+        cv.create_text(w / 2, h * 0.20, text="RLC CIRCUIT", font=(FONT, 52, "bold"), fill=CYAN)
+        cv.create_text(w / 2, h * 0.20 + 70, text="FREQUENCY  RESPONSE  SIMULATOR",
+                       font=(FONT, 24, "bold"), fill="white")
+        cv.create_text(w / 2, h * 0.20 + 115, text="Explore Current  •  Impedance  •  Phase Angle  •  Resonance",
+                       font=(FONT, 14), fill=AMBER)
+        cv.create_window(w / 2, h * 0.58, window=self.btn)
+
+
+class SetupPage(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        tk.Frame(self, bg=CYAN, height=6).pack(fill="x")
+        tk.Label(self, text="Circuit Setup", font=(FONT, 30, "bold"), bg=BG, fg=CYAN).pack(pady=(28, 4))
+        tk.Label(self, text="Enter the component values of your RLC circuit",
+                 font=(FONT, 13), bg=BG, fg=MUTED).pack()
+        card = tk.Frame(self, bg=CARD, padx=40, pady=26, highlightthickness=2, highlightbackground=VIOLET)
+        card.pack(pady=22)
+        rows = [("Source voltage  V  (volts)", "10", AMBER), ("Resistance  R  (Ω)", "100", PINK),
+                ("Inductance  L  (mH)", "10", CYAN), ("Capacitance  C  (µF)", "10", GREEN),
+                ("Starting frequency  f  (Hz)", "500", VIOLET)]
+        self.entries = []
+        for i, (txt, default, col) in enumerate(rows):
+            tk.Label(card, text=txt, font=(FONT, 13, "bold"), bg=CARD, fg=col, anchor="w",
+                     width=28).grid(row=i, column=0, pady=7, sticky="w")
+            e = make_entry(card, col)
+            e.insert(0, default)
+            e.grid(row=i, column=1, padx=(20, 0), pady=7, ipady=4)
+            self.entries.append(e)
+        tk.Label(card, text="Circuit type", font=(FONT, 13, "bold"), bg=CARD, fg=TEXT,
+                 anchor="w", width=28).grid(row=5, column=0, pady=7, sticky="w")
+        self.kind = tk.StringVar(value="Series")
+        rb = tk.Frame(card, bg=CARD)
+        rb.grid(row=5, column=1, padx=(20, 0))
+        for txt in ("Series", "Parallel"):
+            tk.Radiobutton(rb, text=txt, value=txt, variable=self.kind, bg=CARD, fg="white",
+                           selectcolor="#312e81", activebackground=CARD, activeforeground="white",
+                           font=(FONT, 12, "bold")).pack(side="left", padx=6)
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(pady=6)
+        make_button(btns, "←  Back", lambda: self.app.show("welcome"), "#475569").pack(side="left", padx=10)
+        make_button(btns, "Continue  →", self.go, GREEN, fg=BG).pack(side="left", padx=10)
+
+    def go(self):
+        try:
+            V, R, L, C, f = (float(e.get()) for e in self.entries)
+            if min(V, R, L, C, f) <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid input", "Please enter positive numbers in all the boxes.")
+            return
+        c = self.app.circuit
+        c.V, c.R, c.L, c.C, c.kind = V, R, L * 1e-3, C * 1e-6, self.kind.get()
+        if not self.app.freqs:
+            self.app.freqs.append(f)
+        self.app.show("menu")
+
+
+OFFSETS = [(14, 18), (14, -36), (-120, 18), (-120, -36)]
+
+
+def fmt(v, unit):
+    return f"{v:.4g} {unit}".strip()
+
+
+def style_axes(ax):
+    ax.set_facecolor(CARD)
+    for s in ax.spines.values():
+        s.set_color("#475569")
+    ax.tick_params(colors=TEXT, labelsize=10)
+    ax.grid(True, color="#334155", alpha=0.6, ls="--")
+
+
+def annotate_point(ax, x, y, text, i=0):
+    dx, dy = OFFSETS[i % 4]
+    ax.annotate(text, xy=(x, y), xytext=(dx, dy), textcoords="offset points", color="white",
+                fontsize=10, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.35", fc="#312e81", ec=AMBER, lw=1.3),
+                arrowprops=dict(arrowstyle="-|>", color=AMBER, lw=1.5), zorder=6)
+
+
+class Card(tk.Frame):
+    def __init__(self, parent, title, desc, color, command, width=300):
+        super().__init__(parent, bg=CARD, highlightthickness=3, highlightbackground=color,
+                         cursor="hand2", width=width, height=260)
+        self.pack_propagate(False)
+        self.t = tk.Label(self, text=title, font=(FONT, 22, "bold"), bg=CARD, fg=color,
+                          wraplength=width - 40, justify="center")
+        self.t.pack(pady=(40, 14))
+        self.d = tk.Label(self, text=desc, font=(FONT, 12), bg=CARD, fg=MUTED,
+                          wraplength=width - 70, justify="center")
+        self.d.pack()
+        for w in (self, self.t, self.d):
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: self.paint("#1f2a52"))
+            w.bind("<Leave>", lambda e: self.paint(CARD))
+
+    def paint(self, col):
+        for w in (self, self.t, self.d):
+            w.config(bg=col)
+
+
+class ModePage(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        tk.Frame(self, bg=PINK, height=6).pack(fill="x")
+        tk.Label(self, text="What would you like to do?", font=(FONT, 30, "bold"),
+                 bg=BG, fg=PINK).pack(pady=(50, 6))
+        tk.Label(self, text="Choose an analysis mode", font=(FONT, 13), bg=BG, fg=MUTED).pack()
+        row = tk.Frame(self, bg=BG)
+        row.pack(pady=45)
+        Card(row, "Circuit Analysis",
+             "Enter a frequency and get everything: XL, XC, impedance, current, phase, power factor, "
+             "Q factor, bandwidth and all the graphs together",
+             GREEN, lambda: app.show("circuit"), width=400).pack(side="left", padx=24)
+        Card(row, "Graph Analysis",
+             "Choose your own X-axis and Y-axis and plot exactly the graph you want",
+             CYAN, lambda: app.show("graph"), width=400).pack(side="left", padx=24)
+        btns = tk.Frame(self, bg=BG)
+        btns.pack()
+        make_button(btns, "←  Circuit Setup", lambda: app.show("setup"), "#475569").pack(side="left", padx=10)
+        make_button(btns, "Result Analysis  →", lambda: app.show("result"), AMBER, fg=BG).pack(side="left", padx=10)
+
+
+class CircuitPage(tk.Frame):
+    TILE_COLORS = [CYAN, PINK, AMBER, GREEN, VIOLET, CYAN, PINK, AMBER, GREEN, VIOLET, CYAN, PINK, AMBER, GREEN]
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app, self.f = app, None
+        tk.Frame(self, bg=GREEN, height=6).pack(fill="x")
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=20, pady=(10, 4))
+        make_button(top, "←  Back", lambda: app.show("menu"), "#475569", size=11, padx=16, pady=6).pack(side="left")
+        tk.Label(top, text="Circuit Analysis", font=(FONT, 22, "bold"), bg=BG, fg=GREEN).pack(side="left", expand=True)
+        make_button(top, "Result Analysis  →", lambda: app.show("result"), AMBER, fg=BG,
+                    size=11, padx=16, pady=6).pack(side="right")
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=20, pady=6)
+        left = tk.Frame(body, bg=BG)
+        left.pack(side="left", fill="y")
+        inp = tk.Frame(left, bg=CARD, padx=14, pady=10, highlightthickness=2, highlightbackground=VIOLET)
+        inp.pack(fill="x")
+        tk.Label(inp, text="Input frequency (Hz)", font=(FONT, 12, "bold"), bg=CARD, fg=VIOLET).pack(anchor="w")
+        row = tk.Frame(inp, bg=CARD)
+        row.pack(fill="x", pady=6)
+        self.entry = make_entry(row, VIOLET, width=10)
+        self.entry.pack(side="left", ipady=3)
+        self.entry.bind("<Return>", lambda e: self.analyse())
+        make_button(row, "Analyse", self.analyse, GREEN, fg=BG, size=11, padx=18, pady=6).pack(side="left", padx=10)
+
+        grid = tk.Frame(left, bg=BG)
+        grid.pack(fill="x", pady=6)
+        grid.grid_columnconfigure(0, weight=1)
+        grid.grid_columnconfigure(1, weight=1)
+        self.tiles = []
+        for i, col in enumerate(self.TILE_COLORS):
+            t = tk.Frame(grid, bg=CARD, highlightthickness=2, highlightbackground=col, padx=8, pady=3)
+            t.grid(row=i // 2, column=i % 2, sticky="nsew", padx=4, pady=3)
+            n = tk.Label(t, text="", font=(FONT, 10), bg=CARD, fg=MUTED, anchor="w")
+            n.pack(fill="x")
+            v = tk.Label(t, text="—", font=(FONT, 14, "bold"), bg=CARD, fg=col, anchor="w")
+            v.pack(fill="x")
+            self.tiles.append((n, v))
+
+        self.fig = Figure(figsize=(7, 7), dpi=100, facecolor=BG)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=body)
+        self.canvas.get_tk_widget().pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+    def on_show(self):
+        fs = self.app.freqs
+        if self.f is None or self.f not in fs:
+            self.f = fs[-1] if fs else None
+        self.entry.delete(0, "end")
+        if self.f is not None:
+            self.entry.insert(0, f"{self.f:g}")
+        self.fill()
+        self.draw()
+
+    def analyse(self):
+        try:
+            f = float(self.entry.get())
+            if f <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid frequency", "Enter a positive frequency in Hz.")
+            return
+        self.app.add_freq(f)
+        self.f = f
+        self.fill()
+        self.draw()
+
+    def fill(self):
+        c, f = self.app.circuit, self.f
+        f0, Q = c.f0, c.Q
+        if c.kind == "Series":
+            extra = [("Voltage across R", "VR", 1, "V"), ("Voltage across L", "VL", 1, "V"),
+                     ("Voltage across C", "VC", 1, "V")]
+        else:
+            extra = [("Resistor current IR", "IR", 1000, "mA"), ("Inductor current IL", "IL", 1000, "mA"),
+                     ("Capacitor current IC", "IC", 1000, "mA")]
+        names = ["Inductive reactance XL", "Capacitive reactance XC", "Impedance |Z|", "Total current I",
+                 "Phase angle φ", "Power factor", "Circuit nature"] + [e[0] for e in extra] + \
+                ["Resonant frequency f0", "Quality factor Q", "Bandwidth", "Status"]
+        if f is None:
+            values = ["—"] * 14
+        else:
+            m = c.metrics(f)
+            g = lambda k: float(m[k])
+            status = "At resonance" if abs(f - f0) / f0 < 0.02 else ("Below f0" if f < f0 else "Above f0")
+            values = [f"{g('XL'):.2f} Ω", f"{g('XC'):.2f} Ω", f"{g('Z'):.2f} Ω", f"{g('I')*1000:.3f} mA",
+                      f"{g('phi'):.2f} °", f"{g('pf'):.3f}", nature(g("phi"))]
+            values += [f"{g(k)*s:.3f} {u}" for _, k, s, u in extra]
+            values += [f"{f0:.1f} Hz", f"{Q:.2f}", f"{f0/Q:.1f} Hz", status]
+        for (n, v), name, val in zip(self.tiles, names, values):
+            n.config(text=name)
+            v.config(text=val)
+
+    def draw(self):
+        c, f = self.app.circuit, self.f
+        lo = max(1.0, min([c.f0 * 0.2] + ([f * 0.8] if f else [])))
+        hi = max([c.f0 * 3] + ([f * 1.2] if f else []))
+        xs = np.linspace(lo, hi, 1000)
+        m = c.metrics(xs)
+        specs = [("Impedance |Z| (Ω)", m["Z"], PINK, "Z", 1, "Ω"),
+                 ("Current I (mA)", m["I"] * 1000, CYAN, "I", 1000, "mA"),
+                 ("Phase angle φ (°)", m["phi"], GREEN, "phi", 1, "°")]
+        self.fig.clear()
+        axes = self.fig.subplots(3, 1, sharex=True)
+        for ax, (label, ys, col, key, scale, unit) in zip(axes, specs):
+            style_axes(ax)
+            ax.plot(xs, ys, color=col, lw=2.6)
+            ax.axvline(c.f0, color=AMBER, ls="--", lw=1.5)
+            if f:
+                val = float(c.metrics(f)[key]) * scale
+                ax.scatter([f], [val], s=150, color=AMBER, edgecolors="white", linewidths=2, zorder=5)
+                annotate_point(ax, f, val, f"({f:g} Hz, {val:.2f} {unit})")
+            ax.set_ylabel(label, color=TEXT, fontsize=10, fontweight="bold")
+        axes[0].set_title(f"{c.kind} RLC   |   resonance f0 = {c.f0:.1f} Hz (dashed line)",
+                          color=GREEN, fontsize=12, fontweight="bold")
+        axes[-1].set_xlabel("Frequency  f  (Hz)", color=TEXT, fontsize=11, fontweight="bold")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class GraphPage(tk.Frame):
+    COLORS = [CYAN, PINK, GREEN, AMBER, VIOLET]
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        tk.Frame(self, bg=CYAN, height=6).pack(fill="x")
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=20, pady=(10, 4))
+        make_button(top, "←  Back", lambda: app.show("menu"), "#475569", size=11, padx=16, pady=6).pack(side="left")
+        tk.Label(top, text="Graph Analysis", font=(FONT, 22, "bold"), bg=BG, fg=CYAN).pack(side="left", expand=True)
+        make_button(top, "Result Analysis  →", lambda: app.show("result"), AMBER, fg=BG,
+                    size=11, padx=16, pady=6).pack(side="right")
+
+        axbar = tk.Frame(self, bg=CARD, padx=14, pady=8)
+        axbar.pack(fill="x", padx=20, pady=(6, 0))
+        self.xv = tk.StringVar(value="Frequency (Hz)")
+        self.yv = tk.StringVar(value="Current (mA)")
+        tk.Label(axbar, text="X-axis:", font=(FONT, 12, "bold"), bg=CARD, fg=CYAN).pack(side="left")
+        self.xbox = ttk.Combobox(axbar, textvariable=self.xv, state="readonly", width=28,
+                                 style="RLC.TCombobox", font=(FONT, 11))
+        self.xbox.pack(side="left", padx=(8, 24))
+        tk.Label(axbar, text="Y-axis:", font=(FONT, 12, "bold"), bg=CARD, fg=PINK).pack(side="left")
+        self.ybox = ttk.Combobox(axbar, textvariable=self.yv, state="readonly", width=28,
+                                 style="RLC.TCombobox", font=(FONT, 11))
+        self.ybox.pack(side="left", padx=8)
+        for b in (self.xbox, self.ybox):
+            b.bind("<<ComboboxSelected>>", lambda e: self.draw())
+
+        bar = tk.Frame(self, bg=CARD, padx=14, pady=8)
+        bar.pack(fill="x", padx=20, pady=6)
+        tk.Label(bar, text="Input frequency (Hz):", font=(FONT, 12, "bold"), bg=CARD, fg=VIOLET).pack(side="left")
+        self.entry = make_entry(bar, VIOLET, width=10)
+        self.entry.pack(side="left", padx=10, ipady=3)
+        self.entry.bind("<Return>", lambda e: self.add())
+        make_button(bar, "Add point", self.add, GREEN, fg=BG, size=11, padx=16, pady=6).pack(side="left", padx=4)
+        make_button(bar, "Remove last", self.remove_last, "#f97316", size=11, padx=16, pady=6).pack(side="left", padx=4)
+        make_button(bar, "Clear all", self.clear, "#ef4444", size=11, padx=16, pady=6).pack(side="left", padx=4)
+        self.info = tk.Label(bar, text="", font=(FONT, 11, "bold"), bg=CARD, fg=AMBER)
+        self.info.pack(side="right")
+
+        self.fig = Figure(figsize=(9, 5), dpi=100, facecolor=BG)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=20, pady=(4, 14))
+
+    def on_show(self):
+        opts = [k for k, v in PARAMS.items() if self.app.circuit.kind in v["kinds"]]
+        self.xbox["values"] = opts
+        self.ybox["values"] = opts
+        if self.xv.get() not in opts:
+            self.xv.set(opts[0])
+        if self.yv.get() not in opts:
+            self.yv.set(opts[1])
+        self.draw()
+
+    def add(self):
+        try:
+            f = float(self.entry.get())
+            if f <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid frequency", "Enter a positive frequency in Hz.")
+            return
+        if not self.app.add_freq(f):
+            messagebox.showinfo("Already added", f"{f:g} Hz is already on the graph.")
+        self.entry.delete(0, "end")
+        self.draw()
+
+    def remove_last(self):
+        if self.app.freqs:
+            self.app.freqs.pop()
+        self.draw()
+
+    def clear(self):
+        self.app.freqs.clear()
+        self.draw()
+
+    def draw(self):
+        c, fs = self.app.circuit, self.app.freqs
+        xk, yk = self.xv.get(), self.yv.get()
+        px, py = PARAMS[xk], PARAMS[yk]
+        color = self.COLORS[list(PARAMS).index(yk) % len(self.COLORS)]
+        ax = self.ax
+        ax.clear()
+        style_axes(ax)
+
+        lo = max(1.0, min([c.f0 * 0.2] + [f * 0.8 for f in fs]))
+        hi = max([c.f0 * 3] + [f * 1.2 for f in fs])
+        m = c.metrics(np.linspace(lo, hi, 1200))
+        ax.plot(px["fn"](m), py["fn"](m), color=color, lw=2.8, alpha=0.9, label=f"{c.kind} RLC curve")
+        m0 = c.metrics(c.f0)
+        ax.scatter([float(px["fn"](m0))], [float(py["fn"](m0))], marker="*", s=320, color=PINK,
+                   edgecolors="white", linewidths=1.5, zorder=5, label=f"Resonance  f0 = {c.f0:.1f} Hz")
+
+        pts = sorted(fs)
+        if pts:
+            mm = c.metrics(np.array(pts))
+            PX, PY = px["fn"](mm), py["fn"](mm)
+            ax.scatter(PX, PY, s=170, color=AMBER, edgecolors="white", linewidths=2, zorder=5,
+                       label="Your frequencies")
+            for i, (a, b) in enumerate(zip(PX, PY)):
+                annotate_point(ax, a, b, f"({fmt(a, px['unit'])},  {fmt(b, py['unit'])})", i)
+            ml = c.metrics(fs[-1])
+            self.info.config(text=f"Last: f = {fs[-1]:g} Hz →  ({fmt(float(px['fn'](ml)), px['unit'])}, "
+                                  f"{fmt(float(py['fn'](ml)), py['unit'])})")
+        else:
+            ax.text(0.5, 0.5, "Type a frequency above and press  Add point", transform=ax.transAxes,
+                    ha="center", va="center", color=MUTED, fontsize=16)
+            self.info.config(text="No points yet")
+
+        ax.set_xlabel(xk, color=TEXT, fontsize=13, fontweight="bold")
+        ax.set_ylabel(yk, color=TEXT, fontsize=13, fontweight="bold")
+        ax.set_title(f"{yk}  vs  {xk}   ({c.kind} RLC:  R={c.R:g} Ω,  L={c.L*1e3:g} mH,  C={c.C*1e6:g} µF)",
+                     color=color, fontsize=13, fontweight="bold", pad=12)
+        leg = ax.legend(facecolor=BG, edgecolor="#475569", fontsize=10.5, loc="best")
+        for t in leg.get_texts():
+            t.set_color(TEXT)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class ResultPage(tk.Frame):
+    COLS = [("No.", 60), ("Frequency (Hz)", 150), ("Current (mA)", 150), ("Impedance (Ω)", 150),
+            ("Phase (°)", 120), ("Power factor", 130), ("Nature", 130), ("Rating", 190)]
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        tk.Frame(self, bg=AMBER, height=6).pack(fill="x")
+        tk.Label(self, text="Result Analysis", font=(FONT, 28, "bold"), bg=BG, fg=AMBER).pack(pady=(14, 2))
+        self.sub = tk.Label(self, text="", font=(FONT, 12), bg=BG, fg=MUTED)
+        self.sub.pack()
+
+        wrap = tk.Frame(self, bg=CARD, highlightthickness=2, highlightbackground=VIOLET)
+        wrap.pack(fill="x", padx=30, pady=12)
+        self.tree = ttk.Treeview(wrap, columns=[c for c, _ in self.COLS], show="headings",
+                                 height=7, style="RLC.Treeview")
+        for name, w in self.COLS:
+            self.tree.heading(name, text=name)
+            self.tree.column(name, width=w, anchor="center")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="x", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("even", background=CARD)
+        self.tree.tag_configure("odd", background="#1b2444")
+        self.tree.tag_configure("best", background="#065f46", foreground="#ecfdf5")
+
+        box = tk.Frame(self, bg=CARD, highlightthickness=3, highlightbackground=GREEN, padx=22, pady=12)
+        box.pack(fill="x", padx=30, pady=4)
+        self.head = tk.Label(box, text="", font=(FONT, 20, "bold"), bg=CARD, fg=GREEN, anchor="w")
+        self.head.pack(fill="x")
+        self.body = tk.Label(box, text="", font=(FONT, 12), bg=CARD, fg=TEXT, anchor="w",
+                             justify="left", wraplength=980)
+        self.body.pack(fill="x", pady=(6, 0))
+
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(pady=12)
+        make_button(btns, "←  Back", lambda: app.show("menu"), "#475569", size=12).pack(side="left", padx=8)
+        make_button(btns, "Export CSV", self.export, VIOLET, size=12).pack(side="left", padx=8)
+        make_button(btns, "Restart", self.restart, PINK, size=12).pack(side="left", padx=8)
+
+    def compute_rows(self):
+        c = self.app.circuit
+        rows = []
+        for f in sorted(self.app.freqs):
+            m = c.metrics(f)
+            rows.append((f, float(m["I"]) * 1000, float(m["Z"]), float(m["phi"]), float(m["pf"])))
+        return rows
+
+    def on_show(self):
+        c = self.app.circuit
+        rows = self.compute_rows()
+        self.tree.delete(*self.tree.get_children())
+        best = max(rows, key=lambda r: r[4]) if rows else None
+        for i, r in enumerate(rows):
+            is_best = r is best
+            tag = "best" if is_best else ("odd" if i % 2 else "even")
+            self.tree.insert("", "end", tags=(tag,), values=(
+                i + 1, f"{r[0]:g}", f"{r[1]:.3f}", f"{r[2]:.2f}", f"{r[3]:.2f}", f"{r[4]:.3f}",
+                nature(r[3]), rating(r[4]) + ("   ★ BEST" if is_best else "")))
+        self.sub.config(text=f"{c.kind} RLC   |   V = {c.V:g} V,  R = {c.R:g} Ω,  "
+                             f"L = {c.L*1e3:g} mH,  C = {c.C*1e6:g} µF")
+        f0, Q = c.f0, c.Q
+        if not best:
+            self.head.config(text="No frequencies entered yet")
+            self.body.config(text="Go back to a graph page and add some input frequencies.")
+            return
+        f, I, Z, phi, pf = best
+        s, p = c.metrics(f, "Series"), c.metrics(f, "Parallel")
+        text = (f"At {f:g} Hz the {c.kind} circuit gives I = {I:.2f} mA, |Z| = {Z:.1f} Ω, "
+                f"φ = {phi:.1f}° and power factor {pf:.3f}. This is the entered frequency closest to "
+                f"resonance, so the circuit behaves most like a pure resistor there.\n\n"
+                f"Resonant frequency f0 = {f0:.1f} Hz     Q factor = {Q:.2f}     Bandwidth = {f0/Q:.1f} Hz\n\n"
+                f"Series vs Parallel at {f:g} Hz:   Series → I = {float(s['I'])*1000:.2f} mA, "
+                f"|Z| = {float(s['Z']):.1f} Ω     Parallel → I = {float(p['I'])*1000:.2f} mA, "
+                f"|Z| = {float(p['Z']):.1f} Ω\n"
+                f"•  SERIES RLC: impedance is minimum (Z = R) and current is maximum at f0  →  choose Series "
+                f"for the strongest current output.\n"
+                f"•  PARALLEL RLC: impedance is maximum (Z = R) and line current is minimum at f0  →  choose "
+                f"Parallel to select / block that frequency.")
+        if abs(f - f0) / f0 > 0.05:
+            text += f"\n\nTip: try entering a frequency near {f0:.0f} Hz to get the absolute best output."
+        self.head.config(text=f"★  Best frequency:  {f:g} Hz   ({rating(pf)})")
+        self.body.config(text=text)
+
+    def export(self):
+        rows = self.compute_rows()
+        if not rows:
+            messagebox.showinfo("Nothing to export", "No readings yet.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            wr = csv.writer(fh)
+            wr.writerow(["Frequency (Hz)", "Current (mA)", "Impedance (ohm)", "Phase (deg)", "Power factor"])
+            wr.writerows(rows)
+        messagebox.showinfo("Saved", f"Results saved to\n{path}")
+
+    def restart(self):
+        self.app.freqs.clear()
+        self.app.show("welcome")
+
+
+# ---------------------------------------------------------------- app
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("RLC Circuit Simulator")
+        self.geometry("1150x800")
+        self.minsize(1000, 720)
+        self.configure(bg=BG)
+        self.circuit, self.freqs = Circuit(), []
+
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        st.configure("RLC.Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT,
+                     rowheight=34, font=(FONT, 12), borderwidth=0)
+        st.configure("RLC.Treeview.Heading", background="#6d28d9", foreground="white",
+                     font=(FONT, 12, "bold"), relief="flat", padding=6)
+        st.map("RLC.Treeview.Heading", background=[("active", "#7c3aed")])
+        st.map("RLC.Treeview", background=[("selected", "#4338ca")])
+        st.configure("RLC.TCombobox", fieldbackground=BG, background=VIOLET, foreground="white",
+                     arrowcolor="white", padding=4)
+        st.map("RLC.TCombobox", fieldbackground=[("readonly", BG)], foreground=[("readonly", "white")],
+               selectbackground=[("readonly", BG)], selectforeground=[("readonly", "white")])
+        self.option_add("*TCombobox*Listbox.background", CARD)
+        self.option_add("*TCombobox*Listbox.foreground", "white")
+        self.option_add("*TCombobox*Listbox.selectBackground", VIOLET)
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="both", expand=True)
+        box.grid_rowconfigure(0, weight=1)
+        box.grid_columnconfigure(0, weight=1)
+        self.pages = {}
+        for name, cls in (("welcome", WelcomePage), ("setup", SetupPage), ("menu", ModePage),
+                          ("circuit", CircuitPage), ("graph", GraphPage), ("result", ResultPage)):
+            page = cls(box, self)
+            page.grid(row=0, column=0, sticky="nsew")
+            self.pages[name] = page
+        self.show("welcome")
+
+    def show(self, name):
+        page = self.pages[name]
+        page.tkraise()
+        if hasattr(page, "on_show"):
+            page.on_show()
+
+    def add_freq(self, f):
+        if any(abs(f - x) < 1e-9 for x in self.freqs):
+            return False
+        self.freqs.append(f)
+        return True
+
+
+if __name__ == "__main__":
+    App().mainloop()
